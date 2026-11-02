@@ -59,7 +59,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25' # bate com o "go 1.25" do go.mod (exigido por x/crypto v0.55)
+          go-version: '1.26' # bate com o "go 1.25" do go.mod (exigido por x/crypto v0.55)
 
       - name: Download deps
         run: |
@@ -86,7 +86,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v7 # v7 = golangci-lint v2 (o v1 é compilado com go 1.23 e recusa módulos go 1.25)
@@ -139,7 +139,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.26'
 
       - name: Install gosec
         run: go install github.com/securego/gosec/v2/cmd/gosec@latest # instala a ferramenta de SAST pra Go
