@@ -169,7 +169,7 @@ jobs:
   docker:
     needs: [build, lint, security] # espera os 3 jobs acima terminarem com sucesso
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' # em Pull Request, PÁRA por aqui (não builda/publica imagem de PR)
+    if: github.event_name != 'pull_request' # em Pull Request, PÁRA por aqui (não builda/publica imagem de PR)
     steps:
       - uses: actions/checkout@v4
 

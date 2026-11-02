@@ -141,7 +141,7 @@ jobs:
   docker:
     needs: [build, lint, security]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' # só builda/publica imagem em push na main, nunca em PR
+    if: github.event_name != 'pull_request' # só builda/publica imagem em push na main, nunca em PR
     steps:
       - uses: actions/checkout@v4
 

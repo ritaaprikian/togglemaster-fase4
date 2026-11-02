@@ -127,7 +127,7 @@ jobs:
   docker:
     needs: [build, lint, security]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' # PRs não chegam até aqui
+    if: github.event_name != 'pull_request' # PRs não chegam até aqui
     steps:
       - uses: actions/checkout@v4
 
