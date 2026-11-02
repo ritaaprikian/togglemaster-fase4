@@ -22,7 +22,7 @@ spec:
       containers:
         - name: targeting-service
           # Atualizado automaticamente pela pipeline (.github/workflows/targeting-service.yml).
-          image: 339712829131.dkr.ecr.us-east-1.amazonaws.com/togglemaster/targeting-service:24eed3fbb8d8f1b73ff3cd237dec25b0e1a8b55e
+          image: 339712829131.dkr.ecr.us-east-1.amazonaws.com/togglemaster/targeting-service:5e2b074aa4eaf458148ff410e61684c6dffe6523
           ports:
             - containerPort: 8003
           env:
