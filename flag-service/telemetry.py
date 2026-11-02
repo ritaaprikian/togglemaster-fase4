@@ -6,6 +6,7 @@ em cada worker do gunicorn, já que o app não usa --preload.
 """
 import logging
 import os
+import socket
 
 from opentelemetry import metrics, trace
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
@@ -28,7 +29,12 @@ def init_telemetry(app, service_name):
         log.info("OTEL_EXPORTER_OTLP_ENDPOINT não definida: telemetria desligada.")
         return
 
-    resource = Resource.create({"service.name": os.getenv("OTEL_SERVICE_NAME", service_name)})
+    # Cada worker do gunicorn precisa de identidade própria: sem isso, os contadores
+    # dos workers caem na mesma série no Prometheus e as taxas ficam incorretas.
+    resource = Resource.create({
+        "service.name": os.getenv("OTEL_SERVICE_NAME", service_name),
+        "service.instance.id": f"{socket.gethostname()}-{os.getpid()}",
+    })
 
     tracer_provider = TracerProvider(resource=resource)
     tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))

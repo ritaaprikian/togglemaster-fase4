@@ -132,6 +132,23 @@ resource "aws_eks_cluster" "main" {
   ]
 }
 
+# Sem IRSA no Learner Lab, os Pods usam a LabRole do node pelo serviço de metadados
+# (IMDS). O limite de saltos 2 é necessário para a resposta alcançar o contêiner.
+resource "aws_launch_template" "node" {
+  name_prefix = "${var.prefix}-node-"
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = { Name = "${var.prefix}-node" }
+  }
+}
+
 # O grupo de máquinas EC2 que efetivamente rodam os Pods (o control
 # plane acima NÃO roda Pod nenhum, só orquestra).
 resource "aws_eks_node_group" "main" {
@@ -149,6 +166,11 @@ resource "aws_eks_node_group" "main" {
   }
 
   instance_types = [var.instance_type]
+
+  launch_template {
+    id      = aws_launch_template.node.id
+    version = aws_launch_template.node.latest_version
+  }
 
   depends_on = [
     aws_eks_cluster.main,
