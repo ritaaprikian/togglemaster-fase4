@@ -38,7 +38,7 @@ spec:
       containers:
         - name: evaluation-service
           # Atualizado automaticamente pela pipeline (.github/workflows/evaluation-service.yml).
-          image: 339712829131.dkr.ecr.us-east-1.amazonaws.com/togglemaster/evaluation-service:latest
+          image: 339712829131.dkr.ecr.us-east-1.amazonaws.com/togglemaster/evaluation-service:1a600843bbcf374e14d388a59041573337c850ff
           ports:
             - containerPort: 8004
           env:
