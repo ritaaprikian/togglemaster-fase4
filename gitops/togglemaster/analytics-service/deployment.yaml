@@ -29,7 +29,7 @@ spec:
       containers:
         - name: analytics-service
           # Atualizado automaticamente pela pipeline (.github/workflows/analytics-service.yml).
-          image: 339712829131.dkr.ecr.us-east-1.amazonaws.com/togglemaster/analytics-service:latest
+          image: 339712829131.dkr.ecr.us-east-1.amazonaws.com/togglemaster/analytics-service:24eed3fbb8d8f1b73ff3cd237dec25b0e1a8b55e
           ports:
             - containerPort: 8005 # só serve o /health; o trabalho de verdade é o worker interno consumindo o SQS
 
