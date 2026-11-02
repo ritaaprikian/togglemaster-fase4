@@ -14,6 +14,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -21,6 +22,10 @@ from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 
 log = logging.getLogger(__name__)
+
+# Faixas em segundos. As faixas padrão do SDK são para milissegundos: com elas, toda
+# requisição cairia na primeira faixa e a latência p95 apareceria sempre perto de 5 s.
+HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10)
 
 
 def init_telemetry(app, service_name):
@@ -41,7 +46,11 @@ def init_telemetry(app, service_name):
     trace.set_tracer_provider(tracer_provider)
 
     reader = PeriodicExportingMetricReader(OTLPMetricExporter(), export_interval_millis=15000)
-    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[reader]))
+    duration_view = View(
+        instrument_name="http.server.request.duration",
+        aggregation=ExplicitBucketHistogramAggregation(HTTP_DURATION_BUCKETS),
+    )
+    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[reader], views=[duration_view]))
 
     FlaskInstrumentor().instrument_app(app, excluded_urls="health")
     RequestsInstrumentor().instrument()
