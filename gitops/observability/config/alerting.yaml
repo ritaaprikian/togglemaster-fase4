@@ -1,0 +1,92 @@
+# Alerta, destinos e roteamento, provisionados como código pelo sidecar do Grafana.
+# As variáveis $VAR vêm do Secret grafana-alerting, criado fora do Git.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: togglemaster-alerting
+  namespace: observability
+  labels:
+    grafana_alert: "1"
+data:
+  alerting.yaml: |
+    apiVersion: 1
+    contactPoints:
+      - orgId: 1
+        name: togglemaster-oncall
+        receivers:
+          - uid: pagerduty-oncall
+            type: pagerduty
+            settings:
+              integrationKey: $PAGERDUTY_ROUTING_KEY
+              severity: critical
+              summary: '{{ .CommonAnnotations.summary }}'
+          - uid: discord-chatops
+            type: discord
+            settings:
+              url: $DISCORD_WEBHOOK_URL
+              title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+              message: |
+                {{ range .Alerts }}**Serviço:** {{ .Labels.service_name }}
+                **Resumo:** {{ .Annotations.summary }}
+                **Detalhes:** {{ .Annotations.description }}
+                **Início:** {{ .StartsAt }}
+                {{ end }}
+          - uid: self-healing-webhook
+            type: webhook
+            settings:
+              url: http://self-healing.togglemaster.svc.cluster.local/
+              httpMethod: POST
+              authorization_scheme: Bearer
+              authorization_credentials: $WEBHOOK_TOKEN
+    policies:
+      - orgId: 1
+        receiver: togglemaster-oncall
+        group_by: [alertname, service_name]
+        group_wait: 10s
+        group_interval: 1m
+        repeat_interval: 1h # evita alert fatigue enquanto o incidente segue aberto
+    groups:
+      - orgId: 1
+        name: togglemaster-slo
+        folder: ToggleMaster
+        interval: 30s
+        rules:
+          - uid: auth-5xx-rate
+            title: Taxa de erros 5xx do auth-service acima de 5%
+            condition: C
+            for: 1m
+            noDataState: OK
+            execErrState: Alerting
+            labels:
+              severity: critical
+              team: togglemaster
+            annotations:
+              summary: 'auth-service com {{ printf "%.1f" .Values.B.Value }}% de respostas 5xx'
+              description: 'A taxa de 5xx ficou acima de 5% por 1 minuto. O self-healing executa o rollout restart do Deployment.'
+            data:
+              - refId: A
+                relativeTimeRange: { from: 300, to: 0 }
+                datasourceUid: prometheus
+                model:
+                  refId: A
+                  instant: true
+                  expr: |
+                    100 * sum by (service_name) (rate(http_server_request_duration_seconds_count{service_name="auth-service", http_response_status_code=~"5.."}[1m]))
+                      / sum by (service_name) (rate(http_server_request_duration_seconds_count{service_name="auth-service"}[1m]))
+              - refId: B
+                relativeTimeRange: { from: 300, to: 0 }
+                datasourceUid: __expr__
+                model:
+                  refId: B
+                  type: reduce
+                  expression: A
+                  reducer: last
+              - refId: C
+                relativeTimeRange: { from: 300, to: 0 }
+                datasourceUid: __expr__
+                model:
+                  refId: C
+                  type: threshold
+                  expression: B
+                  conditions:
+                    - evaluator: { type: gt, params: [5] }

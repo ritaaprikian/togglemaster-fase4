@@ -1,0 +1,108 @@
+# Plataforma: Secrets no cluster, ArgoCD e App of Apps. Rode depois do Terraform.
+# Os valores vêm de GitHub Secrets ou do state e nunca são impressos no log.
+name: Plataforma (Secrets + ArgoCD)
+on:
+  workflow_dispatch:
+    inputs:
+      passo:
+        description: "plataforma = Secrets + ArgoCD | dados-demo = gera a API key e a flag de demonstração"
+        type: choice
+        options: [plataforma, dados-demo]
+        default: plataforma
+permissions:
+  contents: read
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: togglemaster
+  TF_VERSION: "1.10.5"
+  ARGOCD_VERSION: v2.13.2
+jobs:
+  plataforma:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Configura o kubectl
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Secrets no cluster
+        if: ${{ inputs.passo == 'plataforma' }}
+        working-directory: terraform
+        env:
+          NEW_RELIC_LICENSE_KEY: ${{ secrets.NEW_RELIC_LICENSE_KEY }}
+          PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          BUCKET="togglemaster-tfstate-$(aws sts get-caller-identity --query Account --output text)"
+          terraform init -input=false -backend-config="bucket=$BUCKET" >/dev/null
+          out() { terraform output -raw "$1"; }
+          DB_PASSWORD=$(out db_password); MASTER_KEY=$(out master_key)
+          GRAFANA_PW=$(out grafana_admin_password); TOKEN=$(out self_healing_token)
+          for s in "$DB_PASSWORD" "$MASTER_KEY" "$GRAFANA_PW" "$TOKEN"; do echo "::add-mask::$s"; done
+          apply() { kubectl apply -f - >/dev/null; }
+          for ns in togglemaster observability; do kubectl create namespace "$ns" --dry-run=client -o yaml | apply; done
+          secret() { ns=$1; name=$2; shift 2; kubectl create secret generic "$name" -n "$ns" "$@" --dry-run=client -o yaml | apply; }
+          secret togglemaster auth-service-secrets \
+            --from-literal=DATABASE_URL="postgres://toggleadmin:${DB_PASSWORD}@$(out rds_auth_endpoint):5432/auth_db" \
+            --from-literal=MASTER_KEY="$MASTER_KEY"
+          secret togglemaster flag-service-secrets \
+            --from-literal=DATABASE_URL="postgres://toggleadmin:${DB_PASSWORD}@$(out rds_flag_endpoint):5432/flag_db"
+          secret togglemaster targeting-service-secrets \
+            --from-literal=DATABASE_URL="postgres://toggleadmin:${DB_PASSWORD}@$(out rds_targeting_endpoint):5432/targeting_db"
+          # A chave real é criada no passo dados-demo; não sobrescreve uma já existente.
+          API_KEY=$(kubectl -n togglemaster get secret evaluation-service-secrets -o jsonpath='{.data.SERVICE_API_KEY}' 2>/dev/null | base64 -d || true)
+          [ -n "$API_KEY" ] && echo "::add-mask::$API_KEY"
+          secret togglemaster evaluation-service-secrets \
+            --from-literal=REDIS_URL="$(out elasticache_redis_url)" \
+            --from-literal=SERVICE_API_KEY="${API_KEY:-pendente}"
+          secret togglemaster self-healing-secrets \
+            --from-literal=WEBHOOK_TOKEN="$TOKEN" --from-literal=DISCORD_WEBHOOK_URL="$DISCORD_WEBHOOK_URL"
+          secret observability otel-secrets --from-literal=NEW_RELIC_LICENSE_KEY="$NEW_RELIC_LICENSE_KEY"
+          secret observability grafana-admin --from-literal=admin-user=admin --from-literal=admin-password="$GRAFANA_PW"
+          secret observability grafana-alerting \
+            --from-literal=PAGERDUTY_ROUTING_KEY="$PAGERDUTY_ROUTING_KEY" \
+            --from-literal=DISCORD_WEBHOOK_URL="$DISCORD_WEBHOOK_URL" \
+            --from-literal=WEBHOOK_TOKEN="$TOKEN"
+          kubectl get secrets -n togglemaster -o name
+
+      - name: Instala o ArgoCD e registra o App of Apps
+        if: ${{ inputs.passo == 'plataforma' }}
+        run: |
+          set -euo pipefail
+          kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -n argocd --server-side --force-conflicts -f \
+            "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml" >/dev/null
+          kubectl -n argocd rollout status deploy/argocd-server --timeout=300s
+          kubectl -n argocd patch svc argocd-server -p '{"spec":{"type":"LoadBalancer"}}'
+          kubectl apply -f gitops/root-app.yaml
+
+      - name: Gera a API key e a flag de demonstração
+        if: ${{ inputs.passo == 'dados-demo' }}
+        run: |
+          set -euo pipefail
+          NS=togglemaster
+          kubectl -n "$NS" rollout status deploy/auth-service --timeout=300s
+          # Executa dentro do Pod do auth-service, que já tem a MASTER_KEY no ambiente.
+          RESPONSE=$(kubectl -n "$NS" exec deploy/auth-service -- sh -c \
+            'wget -q -O - --post-data="{\"name\":\"togglemaster-internal\"}" --header="Content-Type: application/json" --header="Authorization: Bearer $MASTER_KEY" http://localhost:8001/admin/keys')
+          API_KEY=$(echo "$RESPONSE" | jq -r .key)
+          echo "::add-mask::$API_KEY"
+          kubectl -n "$NS" patch secret evaluation-service-secrets --type merge \
+            -p "$(jq -n --arg k "$API_KEY" '{stringData:{SERVICE_API_KEY:$k}}')" >/dev/null
+          kubectl -n "$NS" rollout restart deploy/evaluation-service deploy/traffic-generator
+          kubectl -n "$NS" rollout status deploy/evaluation-service --timeout=300s
+          kubectl -n "$NS" rollout status deploy/traffic-generator --timeout=120s
+          kubectl -n "$NS" exec deploy/traffic-generator -- sh -c '
+            H="Authorization: Bearer $SERVICE_API_KEY"; J="Content-Type: application/json"
+            curl -s -o /dev/null -w "flag %{http_code}\n" -X POST -H "$H" -H "$J" -d "{\"name\":\"demo-flag\",\"description\":\"Flag da demonstração\",\"is_enabled\":true}" http://flag-service/flags
+            curl -s -o /dev/null -w "regra %{http_code}\n" -X POST -H "$H" -H "$J" -d "{\"flag_name\":\"demo-flag\",\"rules\":{\"type\":\"PERCENTAGE\",\"value\":50}}" http://targeting-service/rules'

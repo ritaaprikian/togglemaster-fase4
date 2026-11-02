@@ -1,0 +1,264 @@
+# ============================================================
+# PIPELINE DE INFRAESTRUTURA (Terraform) — camada diferente das
+# outras 5 pipelines (.github/workflows/auth-service.yml e etc.):
+# aquelas fazem build/test/push de IMAGEM DOCKER de cada
+# microsserviço; esta aqui cria/atualiza a INFRAESTRUTURA AWS em si
+# (VPC, EKS, RDS, ElastiCache, DynamoDB, SQS, ECR, OIDC, IRSA) rodando
+# `terraform plan`/`terraform apply` dentro do runner do GitHub.
+#
+# PRÉ-REQUISITO — antes do PRIMEIRO push que dispare esta pipeline,
+# rode ./scripts/bootstrap.sh UMA VEZ na sua máquina e configure os 3
+# Secrets que ele imprime no final (AWS_ROLE_ARN_TERRAFORM,
+# TF_STATE_BUCKET, DB_PASSWORD). Sem isso, o job abaixo não consegue
+# nem se autenticar na AWS nem achar o bucket do state. Veja o
+# README.md, seção "Credenciais da pipeline de Terraform".
+#
+# Por que essa Role (AWS_ROLE_ARN_TERRAFORM) é DIFERENTE da Role
+# usada pelas 5 pipelines de aplicação (AWS_ROLE_ARN)? Porque esta
+# aqui precisa de permissão AMPLA (criar VPC, IAM roles, EKS, etc.),
+# enquanto aquelas só precisam de permissão para dar push de imagem
+# no ECR. Separar as duas segue o princípio de menor privilégio: se
+# o token/role de uma pipeline de aplicação vazar, o estrago possível
+# é bem menor do que se fosse a role que pode recriar toda a infra.
+# ============================================================
+name: Terraform Infra CI/CD
+
+on:
+  # PR mexendo em terraform/ -> só faz "plan" (mostra o que mudaria,
+  # sem aplicar nada), pra revisar antes de fazer merge.
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+
+  # push direto em main mexendo em terraform/ -> faz "plan" e, se
+  # o plan for bem-sucedido, "apply" de verdade (cria/atualiza a
+  # infra real na AWS).
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+
+  # Permite disparar manualmente pela aba "Actions" do GitHub. Serve
+  # pra dois casos:
+  #   - action = apply  -> reaplica a infra sem precisar de commit novo
+  #     (ex: depois de atualizar um Secret como o DB_PASSWORD).
+  #   - action = destroy -> roda "terraform plan -destroy" e, se aprovado,
+  #     "terraform destroy" — DERRUBA toda a infra criada por este state.
+  #     Antes de usar, apague os Load Balancers que o Kubernetes/ArgoCD
+  #     criou (kubectl delete svc ...), senão a VPC não deleta. O bucket
+  #     de state, o OIDC do GitHub e a role togglemaster-terraform-ci NÃO
+  #     são tocados (foram criados pelo bootstrap.sh, não pelo Terraform).
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "apply = cria/atualiza a infra | destroy = derruba tudo"
+        type: choice
+        options:
+          - apply
+          - destroy
+        default: apply
+
+# id-token: write -> obrigatório para o OIDC (a action
+# configure-aws-credentials pede um token de identidade ao GitHub e
+# troca por credenciais AWS temporárias). Sem essa permissão, o job
+# recebe "Credentials could not be loaded" mesmo com o Secret certo.
+# pull-requests: write -> só usado pra comentar o resultado do plan
+# direto no Pull Request.
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: "1.10.5" # tem que ser >= 1.10 por causa do use_lockfile no backend.tf
+
+jobs:
+  # ------------------------------------------------------------
+  # JOB 1: PLAN — roda em todo PR e todo push. Só MOSTRA o que
+  # mudaria, não aplica nada. É o jeito seguro de revisar uma
+  # mudança de infraestrutura antes dela virar realidade.
+  # ------------------------------------------------------------
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Instala o Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Troca o token OIDC do GitHub por credenciais AWS temporárias
+      # (minutos de validade) assumindo a Role ampla do bootstrap.
+      # Nenhuma access key fica guardada em lugar nenhum.
+      - name: Autentica na AWS (credenciais do Learner Lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -backend-config injeta o nome do bucket (que é específico da
+      # SUA conta AWS) sem precisar hardcodar ele em backend.tf — veja
+      # o comentário em terraform/backend.tf pra entender por quê.
+      - name: Garante o bucket do state
+        run: |
+          BUCKET="togglemaster-tfstate-$(aws sts get-caller-identity --query Account --output text)"
+          aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null || aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION"
+          aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
+          echo "TF_STATE_BUCKET=$BUCKET" >> "$GITHUB_ENV"
+
+      - name: Terraform Init
+        run: terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      # TF_VAR_db_password: assim o Terraform provider AWS lê a
+      # variável "db_password" (definida em variables.tf, sem
+      # default) direto do ambiente, sem precisar de um arquivo
+      # terraform.tfvars commitado (que exporia a senha no Git).
+      # PLAN_FLAGS ganha "-destroy" só quando o workflow foi disparado
+      # manualmente com action=destroy — aí o tfplan gerado é um plano
+      # de destruição, e o job "apply" abaixo aplica exatamente ele.
+      - name: Terraform Plan
+        id: plan
+        env:
+          PLAN_FLAGS: ${{ (github.event_name == 'workflow_dispatch' && inputs.action == 'destroy') && '-destroy' || '' }}
+        run: terraform plan -no-color -input=false $PLAN_FLAGS -out=tfplan
+        continue-on-error: true
+
+      # Publica o resultado do plan como comentário no PR, pra quem
+      # for revisar não precisar abrir os logs do Actions.
+      - name: Comenta o plan no Pull Request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+      # O passo "plan" acima usa continue-on-error só pra conseguir
+      # capturar o stdout e comentar no PR mesmo se der erro — aqui a
+      # gente FALHA o job de verdade se o plan não deu certo, senão um
+      # erro de sintaxe passaria batido.
+      - name: Falha o job se o plan deu erro
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      # Guarda o plano já calculado como artifact, pra o job de apply
+      # (se for rodar) usar EXATAMENTE o mesmo plano revisado, em vez
+      # de calcular um novo (que poderia já estar desatualizado).
+      - name: Upload do plano
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan
+          retention-days: 1
+
+  # ------------------------------------------------------------
+  # JOB 2: APPLY — só roda em push na branch main (nunca em PR, pra
+  # nenhuma alteração real acontecer antes de revisar/mergear).
+  # `environment: production` é o que permite configurar, direto no
+  # GitHub (Settings > Environments > production > Required
+  # reviewers), uma APROVAÇÃO MANUAL obrigatória antes deste job
+  # rodar — recomendado, já que ele cria infraestrutura real e
+  # cobrada na sua conta AWS.
+  # ------------------------------------------------------------
+  apply:
+    name: Terraform Apply
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Instala o Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Autentica na AWS (credenciais do Learner Lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Garante o bucket do state
+        run: |
+          BUCKET="togglemaster-tfstate-$(aws sts get-caller-identity --query Account --output text)"
+          aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null || aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION"
+          aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
+          echo "TF_STATE_BUCKET=$BUCKET" >> "$GITHUB_ENV"
+
+      - name: Terraform Init
+        run: terraform init -backend-config="bucket=$TF_STATE_BUCKET"
+
+      - name: Baixa o plano gerado no job "plan"
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform
+
+      # ----------------------------------------------------------
+      # PRÉ-DESTROY: apaga os LoadBalancers criados pelo Kubernetes
+      # (ELB do argocd-server, e qualquer Service type=LoadBalancer no
+      # cluster). Eles NÃO estão no state do Terraform, então se
+      # ficarem de pé o `terraform destroy` falha ao deletar a VPC
+      # (ENIs/SGs presos). Só roda no fluxo de destroy.
+      # ----------------------------------------------------------
+      - name: Pré-destroy — remove LoadBalancers do cluster
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.action == 'destroy' }}
+        continue-on-error: true # se o cluster já não existir, segue o destroy
+        run: |
+          aws eks update-kubeconfig --name togglemaster --region "$AWS_REGION" || exit 0
+          # remove a Application do ArgoCD (pra o controller não recriar nada)
+          kubectl delete application togglemaster -n argocd --ignore-not-found --timeout=60s || true
+          # apaga todo Service type=LoadBalancer de todos os namespaces
+          kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' \
+            | while read ns name; do
+                [ -n "$name" ] && kubectl delete svc "$name" -n "$ns" --ignore-not-found --timeout=60s || true
+              done
+          # dá tempo do cloud-controller-manager remover os ELBs na AWS
+          echo "Aguardando 120s a AWS remover os ELBs..."
+          sleep 120
+
+      # Aplica o MESMO plano que foi revisado/aprovado acima, em vez
+      # de recalcular um novo — evita "TOCTOU" (a infra real mudar
+      # entre o plan e o apply sem ninguém perceber). Se o plano for
+      # de destroy (action=destroy no dispatch), é este mesmo comando
+      # que derruba a infra — `apply` de um plano `-destroy` destrói.
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve tfplan
+
+      # A partir daqui só faz sentido quando a infra existe — num
+      # destroy não há outputs pra ler nem pra escrever no GitOps.
+      - name: Mostra os outputs
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.action == 'destroy') }}
+        run: terraform output
+

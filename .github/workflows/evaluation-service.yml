@@ -1,0 +1,192 @@
+# ============================================================
+# PIPELINE DE CI/CD DO evaluation-service (Go)
+#
+# Estrutura idêntica à do auth-service.yml (veja os comentários lá
+# pra entender o "porquê" de cada parte) — aqui só destacamos o que
+# é ESPECÍFICO deste serviço: ele é o "hot path" (rota de alta
+# performance) do sistema, então o teste unitário
+# evaluation-service/evaluator_test.go valida a função
+# getDeterministicBucket (a lógica de "em qual % de rollout este
+# usuário cai"), que é pura lógica sem dependência de banco/rede —
+# ideal pra um teste rápido e confiável.
+# ============================================================
+
+name: Evaluation Service CI/CD
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths: ['evaluation-service/**', '.github/workflows/evaluation-service.yml']
+  pull_request:
+    branches: [main]
+    paths: ['evaluation-service/**', '.github/workflows/evaluation-service.yml']
+
+permissions:
+  id-token: write        # necessário pro OIDC (job "docker" assume a Role via configure-aws-credentials)
+  contents: write
+  security-events: write # upload dos SARIF (Trivy/gosec) na aba Security
+
+env:
+  SERVICE_NAME: evaluation-service
+  ECR_REPOSITORY: togglemaster/evaluation-service
+  AWS_REGION: us-east-1
+
+jobs:
+  # ─── 1. Build & Unit Test ───────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Download deps
+        run: |
+          cd ${{ env.SERVICE_NAME }}
+          go mod download
+      - name: Run unit tests
+        run: |
+          cd ${{ env.SERVICE_NAME }}
+          go test ./... -v -race # roda evaluator_test.go entre outros
+
+  # ─── 2. Linter ────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v7 # v7 = golangci-lint v2 (v1 recusa módulo go 1.25)
+        with:
+          version: latest
+          working-directory: ${{ env.SERVICE_NAME }}
+
+  # ─── 3. Security Scan (SAST + SCA) — mesma lógica de "relatório completo + gate" do auth-service.yml ──
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 'Trivy (SCA) - relatório completo'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '${{ env.SERVICE_NAME }}'
+          format: 'sarif'
+          output: 'trivy-fs.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-fs.sarif'
+
+      - name: 'Trivy (SCA) - bloqueio em CRITICAL'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '${{ env.SERVICE_NAME }}'
+          format: 'table'
+          exit-code: '1' # falha o job se achar algo CRITICAL
+          severity: 'CRITICAL'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      - name: 'gosec (SAST) - relatório completo'
+        run: |
+          cd ${{ env.SERVICE_NAME }}
+          gosec -fmt sarif -out ../gosec-results.sarif ./... || true # "|| true": não bloqueia, só reporta
+
+      - name: Upload gosec SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'gosec-results.sarif'
+
+      - name: 'gosec (SAST) - bloqueio em severidade HIGH'
+        run: |
+          cd ${{ env.SERVICE_NAME }}
+          # -exclude=G704: a regra "SSRF via taint analysis" (nova no gosec)
+          # marca as chamadas ao flag/targeting-service — a URL base é fixa
+          # (env var do cluster) e só o nome da flag vem da request. O
+          # achado continua no relatório completo/SARIF acima, só não trava
+          # o gate. As demais regras HIGH continuam bloqueando.
+          gosec -severity high -exclude=G704 ./...
+
+  # ─── 4. Docker Build & Push ─────────────────────────────────
+  docker:
+    needs: [build, lint, security]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' # PRs não chegam até aqui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (Learner Lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }} # endereço do ECR da conta
+          IMAGE_TAG: ${{ github.sha }} # tag = hash do commit, sempre única
+        run: |
+          docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ${{ env.SERVICE_NAME }}/
+          docker tag $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $REGISTRY/$ECR_REPOSITORY:latest
+          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: 'Scan da imagem - relatório completo'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-image.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Upload container scan SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-image.sarif'
+
+      - name: 'Scan da imagem - bloqueio em CRITICAL'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL'
+          ignore-unfixed: true  # so bloqueia CRITICAL COM correcao disponivel (nao trava em CVE de SO sem patch)
+
+
+      - name: Update GitOps
+        run: |
+          sed -i "s|image: .*|image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}|" gitops/togglemaster/${{ env.SERVICE_NAME }}/deployment.yaml
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add gitops/togglemaster/${{ env.SERVICE_NAME }}/deployment.yaml
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(gitops): ${{ env.SERVICE_NAME }} -> ${{ github.sha }} [skip ci]"
+            for i in 1 2 3 4 5; do
+              git pull --rebase origin main && git push origin HEAD:main && break
+              echo "push rejeitado (tentativa $i), retentando..."
+              sleep $((RANDOM % 4 + 2))
+            done
+          fi

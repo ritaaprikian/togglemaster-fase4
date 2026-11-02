@@ -1,0 +1,18 @@
+# Dispara as 5 pipelines de aplicação de uma vez (Secrets de AWS precisam estar válidos).
+name: Build de todos os serviços
+on:
+  workflow_dispatch: {}
+permissions:
+  actions: write
+  contents: read
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for svc in auth flag targeting evaluation analytics; do
+            gh workflow run "$svc-service.yml" --ref main
+          done

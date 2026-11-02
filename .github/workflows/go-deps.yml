@@ -1,0 +1,32 @@
+# Resolve as dependências de OpenTelemetry dos serviços Go e commita go.mod e go.sum.
+name: Atualiza dependências Go
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: go get e go mod tidy
+        run: |
+          OTEL="go.opentelemetry.io/otel go.opentelemetry.io/otel/sdk go.opentelemetry.io/otel/sdk/metric \
+            go.opentelemetry.io/otel/trace go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp \
+            go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp \
+            go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+          for svc in auth-service evaluation-service; do
+            (cd "$svc" && go get $OTEL && go mod tidy)
+          done
+          (cd auth-service && go get github.com/XSAM/otelsql && go mod tidy)
+          go -C auth-service test ./...
+          go -C evaluation-service test ./...
+      - name: Commita
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add auth-service/go.* evaluation-service/go.*
+          git diff --staged --quiet || { git commit -m "chore(deps): dependências OpenTelemetry dos serviços Go" && git push; }

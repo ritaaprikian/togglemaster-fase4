@@ -1,0 +1,143 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: self-healing-script
+  namespace: togglemaster
+data:
+  healer.py: |
+    """Runbook de self-healing: recebe o webhook do Grafana e reinicia o Deployment.
+
+    Equivale a `kubectl rollout restart deployment/<serviço>`, chamando a API do
+    Kubernetes com a ServiceAccount do Pod. Só usa a biblioteca padrão do Python.
+    """
+    import datetime
+    import hmac
+    import json
+    import os
+    import ssl
+    import time
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    NAMESPACE = os.environ.get("TARGET_NAMESPACE", "togglemaster")
+    ALLOWED = {f"{s}-service" for s in ("auth", "flag", "targeting", "evaluation", "analytics")}
+    COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "300"))
+    TOKEN = os.environ["WEBHOOK_TOKEN"]
+    DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    API_SERVER = os.environ.get("KUBERNETES_API", "https://kubernetes.default.svc")
+    SA_DIR = os.environ.get("SA_DIR", "/var/run/secrets/kubernetes.io/serviceaccount")
+
+    last_restart = {}
+
+
+    def log(event, **fields):
+        print(json.dumps({"time": now(), "component": "self-healing", "event": event, **fields}), flush=True)
+
+
+    def now():
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+    def rollout_restart(deployment):
+        """Mesmo patch aplicado por `kubectl rollout restart`."""
+        with open(f"{SA_DIR}/token", encoding="utf8") as f:
+            sa_token = f.read().strip()
+        body = {"spec": {"template": {"metadata": {"annotations": {
+            "kubectl.kubernetes.io/restartedAt": now(),
+        }}}}}
+        request = urllib.request.Request(
+            f"{API_SERVER}/apis/apps/v1/namespaces/{NAMESPACE}/deployments/{deployment}",
+            data=json.dumps(body).encode(),
+            method="PATCH",
+            headers={"Authorization": f"Bearer {sa_token}", "Content-Type": "application/strategic-merge-patch+json"},
+        )
+        context = None
+        if API_SERVER.startswith("https://"):
+            context = ssl.create_default_context(cafile=f"{SA_DIR}/ca.crt")
+        with urllib.request.urlopen(request, context=context, timeout=10) as response:
+            return response.status
+
+
+    def notify_discord(message):
+        if not DISCORD_WEBHOOK_URL:
+            return
+        request = urllib.request.Request(
+            DISCORD_WEBHOOK_URL,
+            data=json.dumps({"content": message}).encode(),
+            headers={"Content-Type": "application/json", "User-Agent": "togglemaster-self-healing/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5):
+                pass
+        except OSError as error:
+            log("discord_failed", error=str(error))
+
+
+    def handle_alerts(payload, clock=time.monotonic):
+        """Decide e executa as ações de um webhook. Retorna o resultado por serviço."""
+        results = {}
+        for alert in payload.get("alerts", []):
+            if alert.get("status") != "firing":
+                continue
+            service = alert.get("labels", {}).get("service_name", "")
+            if service in results:
+                continue
+            if service not in ALLOWED:
+                log("ignored", service=service, reason="serviço fora da lista permitida")
+                results[service] = "ignored"
+                continue
+            elapsed = clock() - last_restart.get(service, -COOLDOWN_SECONDS)
+            if elapsed < COOLDOWN_SECONDS:
+                log("cooldown", service=service, remaining_seconds=int(COOLDOWN_SECONDS - elapsed))
+                results[service] = "cooldown"
+                continue
+            log("rollout_restart_started", service=service, alert=alert.get("labels", {}).get("alertname", ""))
+            try:
+                rollout_restart(service)
+            except OSError as error:
+                log("rollout_restart_failed", service=service, error=str(error))
+                notify_discord(f":x: **Self-healing falhou** em `{service}`: {error}")
+                results[service] = "failed"
+                continue
+            last_restart[service] = clock()
+            log("rollout_restart_succeeded", service=service)
+            notify_discord(
+                f":wrench: **Self-healing executado**: `kubectl rollout restart deployment/{service}` "
+                f"no namespace `{NAMESPACE}` às {now()}."
+            )
+            results[service] = "restarted"
+        return results
+
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self, status, body):
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            self._reply(200, {"status": "ok"})
+
+        def do_POST(self):
+            supplied = self.headers.get("Authorization", "").removeprefix("Bearer ")
+            if not hmac.compare_digest(supplied, TOKEN):
+                log("unauthorized")
+                self._reply(401, {"error": "não autorizado"})
+                return
+            try:
+                payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            except ValueError:
+                self._reply(400, {"error": "JSON inválido"})
+                return
+            self._reply(200, {"results": handle_alerts(payload)})
+
+        def log_message(self, *args):
+            pass
+
+
+    if __name__ == "__main__":
+        log("started", namespace=NAMESPACE, cooldown_seconds=COOLDOWN_SECONDS)
+        ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()

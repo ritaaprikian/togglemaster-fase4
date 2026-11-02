@@ -1,0 +1,21 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: togglemaster
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ritaaprikian/togglemaster-fase4.git
+    targetRevision: main
+    path: gitops/togglemaster
+    directory: { recurse: true }
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: togglemaster
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true]
+    retry: { limit: 10, backoff: { duration: 30s, factor: 2, maxDuration: 5m } }

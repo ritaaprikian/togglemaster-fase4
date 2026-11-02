@@ -1,0 +1,35 @@
+# Prometheus (métricas) e Grafana (visualização e alertas).
+fullnameOverride: kps
+alertmanager:
+  enabled: false # os alertas ficam no Grafana, que integra PagerDuty, Discord e webhook
+kubeControllerManager: { enabled: false } # no EKS, o control plane não é acessível
+kubeScheduler: { enabled: false }
+kubeEtcd: { enabled: false }
+kubeProxy: { enabled: false }
+prometheus:
+  prometheusSpec:
+    enableRemoteWriteReceiver: true # recebe as métricas enviadas pelo OTel Collector
+    retention: 3d
+    resources:
+      requests: { cpu: 200m, memory: 800Mi }
+      limits: { memory: 2Gi }
+grafana:
+  fullnameOverride: grafana
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  service:
+    type: LoadBalancer
+    port: 80
+  envFromSecret: grafana-alerting
+  defaultDashboardsTimezone: browser
+  additionalDataSources:
+    - name: Loki
+      uid: loki
+      type: loki
+      access: proxy
+      url: http://loki.observability.svc.cluster.local:3100
+  sidecar:
+    dashboards: { enabled: true, label: grafana_dashboard, searchNamespace: ALL }
+    alerts: { enabled: true, label: grafana_alert, searchNamespace: ALL }
